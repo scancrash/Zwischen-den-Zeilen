@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
-import { openDb, getSetting, setSetting, newInviteCode } from './db.js';
+import { connectFromEnv, initSchema, getSetting, setSetting, newInviteCode } from './db.js';
 import { buildCalendar } from './ics.js';
 import { searchBooks, fetchDescription } from './openlibrary.js';
 
@@ -19,6 +19,11 @@ class HttpError extends Error {
   }
 }
 const bad = (msg) => new HttpError(400, msg);
+const idOf = (v) => {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 2147483647) throw new HttpError(404, 'Nicht gefunden.');
+  return n;
+};
 
 // ---------- Passwörter ----------
 function hashPassword(pw) {
@@ -40,19 +45,6 @@ const str = (v, max, { required = false, name = 'Feld' } = {}) => {
 };
 
 export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
-  const q = (sql) => db.prepare(sql);
-  const tx = (fn) => {
-    db.exec('BEGIN');
-    try {
-      const r = fn();
-      db.exec('COMMIT');
-      return r;
-    } catch (e) {
-      db.exec('ROLLBACK');
-      throw e;
-    }
-  };
-
   const failures = new Map(); // ip -> {count, until}
   const throttled = (ip) => (failures.get(ip)?.until ?? 0) > Date.now() && failures.get(ip).count >= 10;
   const noteFailure = (ip) => {
@@ -61,20 +53,20 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
   };
 
   // ---------- Daten ----------
-  const booksFor = (uid) =>
-    q(`SELECT b.id, b.title, b.author, b.cover_url, b.year, b.pages, b.description, b.status, b.position, b.created_at,
+  const booksFor = async (uid) =>
+    (await db.all(`SELECT b.id, b.title, b.author, b.cover_url, b.year, b.pages, b.description, b.status, b.position, b.created_at,
               u.name AS suggested_by_name, b.suggested_by,
-              (SELECT COUNT(*) FROM votes v WHERE v.book_id = b.id) AS votes,
+              (SELECT COUNT(*) FROM votes v WHERE v.book_id = b.id)::int AS votes,
               EXISTS(SELECT 1 FROM votes v WHERE v.book_id = b.id AND v.user_id = ?) AS voted,
-              (SELECT COUNT(*) FROM comments c WHERE c.book_id = b.id) AS comment_count
+              (SELECT COUNT(*) FROM comments c WHERE c.book_id = b.id)::int AS comment_count
          FROM books b LEFT JOIN users u ON u.id = b.suggested_by
-        ORDER BY b.created_at DESC, b.id DESC`).all(uid).map((b) => ({ ...b, voted: !!b.voted }));
+        ORDER BY b.created_at DESC, b.id DESC`, [uid])).map((b) => ({ ...b, voted: !!b.voted }));
 
-  const meetingsFor = (uid) => {
-    const rows = q(`SELECT m.*, b.title AS book_title, b.author AS book_author, b.cover_url AS book_cover
+  const meetingsFor = async (uid) => {
+    const rows = await db.all(`SELECT m.*, b.title AS book_title, b.author AS book_author, b.cover_url AS book_cover
                       FROM meetings m LEFT JOIN books b ON b.id = m.book_id
-                     ORDER BY m.starts_at`).all();
-    const rs = q(`SELECT r.meeting_id, r.user_id, r.status, u.name FROM rsvps r JOIN users u ON u.id = r.user_id`).all();
+                     ORDER BY m.starts_at`);
+    const rs = await db.all('SELECT r.meeting_id, r.user_id, r.status, u.name FROM rsvps r JOIN users u ON u.id = r.user_id');
     return rows.map((m) => {
       const mine = rs.filter((r) => r.meeting_id === m.id);
       return {
@@ -87,19 +79,19 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
 
   const publicUser = (u) => ({ id: u.id, name: u.name, is_admin: !!u.is_admin });
 
-  function startSession(res, userId, secure) {
+  async function startSession(res, userId, secure) {
     const token = randomBytes(32).toString('hex');
-    q('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, userId);
+    await db.run('INSERT INTO sessions (token, user_id) VALUES (?, ?)', [token, userId]);
     res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`);
   }
 
-  const bookById = (id) => {
-    const b = q('SELECT * FROM books WHERE id = ?').get(id);
+  const bookById = async (id) => {
+    const b = await db.get('SELECT * FROM books WHERE id = ?', [idOf(id)]);
     if (!b) throw new HttpError(404, 'Buch nicht gefunden.');
     return b;
   };
-  const meetingById = (id) => {
-    const m = q('SELECT * FROM meetings WHERE id = ?').get(id);
+  const meetingById = async (id) => {
+    const m = await db.get('SELECT * FROM meetings WHERE id = ?', [idOf(id)]);
     if (!m) throw new HttpError(404, 'Termin nicht gefunden.');
     return m;
   };
@@ -107,14 +99,14 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
     if (!c.user.is_admin) throw new HttpError(403, 'Nur Admins dürfen das.');
   };
 
-  function meetingInput(body, existing = {}) {
+  async function meetingInput(body, existing = {}) {
     const startsRaw = body.starts_at ?? existing.starts_at;
     const start = new Date(startsRaw);
     if (!startsRaw || Number.isNaN(start.getTime())) throw bad('Bitte Datum und Uhrzeit angeben.');
     const duration = Number(body.duration_min ?? existing.duration_min ?? 120);
     if (!Number.isInteger(duration) || duration < 15 || duration > 720) throw bad('Dauer muss zwischen 15 und 720 Minuten liegen.');
     const bookId = 'book_id' in body ? (body.book_id ? Number(body.book_id) : null) : existing.book_id ?? null;
-    if (bookId) bookById(bookId);
+    if (bookId) await bookById(bookId);
     return {
       starts_at: start.toISOString(),
       duration_min: duration,
@@ -125,9 +117,9 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
   }
 
   const icsRows = () =>
-    q(`SELECT m.*, b.title AS book_title, b.author AS book_author
-         FROM meetings m LEFT JOIN books b ON b.id = m.book_id ORDER BY m.starts_at`).all();
-  const calOpts = (c) => ({ clubName: getSetting(db, 'club_name'), baseUrl: baseUrl || c.origin });
+    db.all(`SELECT m.*, b.title AS book_title, b.author AS book_author
+         FROM meetings m LEFT JOIN books b ON b.id = m.book_id ORDER BY m.starts_at`);
+  const calOpts = async (c) => ({ clubName: await getSetting(db, 'club_name'), baseUrl: baseUrl || c.origin });
   const raw = (body, type, filename) => ({ __raw: true, body, type, filename });
 
   // ---------- Routen ----------
@@ -136,47 +128,50 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
     if (typeof opts === 'function') [fn, opts] = [opts, {}];
     routes.push({ method, re: new RegExp(`^${path.replace(/:(\w+)/g, '(?<$1>[^/]+)')}$`), auth: opts.auth !== false, fn });
   };
+  const secure = (c) => c.origin.startsWith('https:');
+  const count = async (sql) => (await db.get(sql)).n;
 
-  route('POST', '/api/register', { auth: false }, (c) => {
+  route('POST', '/api/register', { auth: false }, async (c) => {
     const name = str(c.body.name, 40, { required: true, name: 'Name' });
     const pw = typeof c.body.password === 'string' ? c.body.password : '';
     if (pw.length < 6) throw bad('Das Passwort braucht mindestens 6 Zeichen.');
-    const first = q('SELECT COUNT(*) AS n FROM users').get().n === 0;
-    if (!first && String(c.body.invite ?? '').trim().toUpperCase() !== getSetting(db, 'invite_code'))
+    const first = (await count('SELECT COUNT(*)::int AS n FROM users')) === 0;
+    if (!first && String(c.body.invite ?? '').trim().toUpperCase() !== (await getSetting(db, 'invite_code')))
       throw new HttpError(403, 'Der Einladungscode stimmt nicht.');
-    if (q('SELECT 1 FROM users WHERE name = ?').get(name)) throw new HttpError(409, 'Dieser Name ist schon vergeben.');
-    const { lastInsertRowid } = q('INSERT INTO users (name, pw_hash, is_admin) VALUES (?, ?, ?)').run(name, hashPassword(pw), first ? 1 : 0);
-    startSession(c.res, Number(lastInsertRowid), c.origin.startsWith('https:'));
+    if (await db.get('SELECT 1 FROM users WHERE lower(name) = lower(?)', [name])) throw new HttpError(409, 'Dieser Name ist schon vergeben.');
+    const { id } = await db.get('INSERT INTO users (name, pw_hash, is_admin) VALUES (?, ?, ?) RETURNING id', [name, hashPassword(pw), first ? 1 : 0]);
+    await startSession(c.res, id, secure(c));
     return { ok: true };
   });
 
-  route('POST', '/api/login', { auth: false }, (c) => {
+  route('POST', '/api/login', { auth: false }, async (c) => {
     if (throttled(c.ip)) throw new HttpError(429, 'Zu viele Versuche. Bitte später erneut probieren.');
-    const u = q('SELECT * FROM users WHERE name = ?').get(String(c.body.name ?? '').trim());
+    const u = await db.get('SELECT * FROM users WHERE lower(name) = lower(?)', [String(c.body.name ?? '').trim()]);
     if (!u || !checkPassword(String(c.body.password ?? ''), u.pw_hash)) {
       noteFailure(c.ip);
       throw new HttpError(401, 'Name oder Passwort falsch.');
     }
-    startSession(c.res, u.id, c.origin.startsWith('https:'));
+    await startSession(c.res, u.id, secure(c));
     return { ok: true };
   });
 
-  route('POST', '/api/logout', (c) => {
-    q('DELETE FROM sessions WHERE token = ?').run(c.token);
-    c.res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+  route('POST', '/api/logout', async (c) => {
+    await db.run('DELETE FROM sessions WHERE token = ?', [c.token]);
+    c.res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure(c) ? '; Secure' : ''}`);
     return { ok: true };
   });
 
-  route('GET', '/api/state', { auth: false }, (c) => {
-    if (!c.user) return { me: null, has_users: q('SELECT COUNT(*) AS n FROM users').get().n > 0, club_name: getSetting(db, 'club_name') };
+  route('GET', '/api/state', { auth: false }, async (c) => {
+    const clubName = await getSetting(db, 'club_name');
+    if (!c.user) return { me: null, has_users: (await count('SELECT COUNT(*)::int AS n FROM users')) > 0, club_name: clubName };
     return {
       me: publicUser(c.user),
-      club_name: getSetting(db, 'club_name'),
-      books: booksFor(c.user.id),
-      meetings: meetingsFor(c.user.id),
-      members: q('SELECT id, name, is_admin FROM users ORDER BY name').all().map(publicUser),
-      calendar_path: `/calendar.ics?token=${getSetting(db, 'cal_token')}`,
-      invite_code: c.user.is_admin ? getSetting(db, 'invite_code') : undefined,
+      club_name: clubName,
+      books: await booksFor(c.user.id),
+      meetings: await meetingsFor(c.user.id),
+      members: (await db.all('SELECT id, name, is_admin FROM users ORDER BY lower(name)')).map(publicUser),
+      calendar_path: `/calendar.ics?token=${await getSetting(db, 'cal_token')}`,
+      invite_code: c.user.is_admin ? await getSetting(db, 'invite_code') : undefined,
     };
   });
 
@@ -194,155 +189,161 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
     const title = str(b.title, 300, { required: true, name: 'Titel' });
     const author = str(b.author, 200);
     const sourceKey = b.source_key ? str(b.source_key, 100) : null;
-    if (sourceKey && q('SELECT 1 FROM books WHERE source_key = ?').get(sourceKey)) throw new HttpError(409, 'Dieses Buch wurde schon vorgeschlagen.');
-    if (q('SELECT 1 FROM books WHERE lower(title) = lower(?) AND lower(author) = lower(?)').get(title, author))
+    if (sourceKey && (await db.get('SELECT 1 FROM books WHERE source_key = ?', [sourceKey]))) throw new HttpError(409, 'Dieses Buch wurde schon vorgeschlagen.');
+    if (await db.get('SELECT 1 FROM books WHERE lower(title) = lower(?) AND lower(author) = lower(?)', [title, author]))
       throw new HttpError(409, 'Dieses Buch wurde schon vorgeschlagen.');
-    const int = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
+    const int = (v) => (Number.isInteger(Number(v)) && Number(v) > 0 && Number(v) < 2147483647 ? Number(v) : null);
     const cover = typeof b.cover_url === 'string' && /^https:\/\//.test(b.cover_url) ? b.cover_url.slice(0, 500) : '';
     const description = str(b.description, 2000) || (await fetchDescription(sourceKey));
-    const id = tx(() => {
-      const { lastInsertRowid } = q(`INSERT INTO books (title, author, cover_url, year, pages, description, source_key, suggested_by)
-                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(title, author, cover, int(b.year), int(b.pages), description, sourceKey, c.user.id);
-      q('INSERT INTO votes (book_id, user_id) VALUES (?, ?)').run(lastInsertRowid, c.user.id);
-      return Number(lastInsertRowid);
+    const id = await db.tx(async (t) => {
+      const row = await t.get(`INSERT INTO books (title, author, cover_url, year, pages, description, source_key, suggested_by)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+        [title, author, cover, int(b.year), int(b.pages), description, sourceKey, c.user.id]);
+      await t.run('INSERT INTO votes (book_id, user_id) VALUES (?, ?)', [row.id, c.user.id]);
+      return row.id;
     });
     return { id };
   });
 
-  route('POST', '/api/books/reorder', (c) => {
+  route('POST', '/api/books/reorder', async (c) => {
     requireAdmin(c);
-    const ids = Array.isArray(c.body.ids) ? c.body.ids.map(Number) : [];
-    tx(() => ids.forEach((id, i) => q("UPDATE books SET position = ? WHERE id = ? AND status = 'queued'").run(i + 1, id)));
-    return { ok: true };
-  });
-
-  route('PATCH', '/api/books/:id', (c) => {
-    requireAdmin(c);
-    const book = bookById(Number(c.params.id));
-    const { status } = c.body;
-    if (!STATUSES.includes(status)) throw bad('Ungültiger Status.');
-    tx(() => {
-      if (status === 'current') q("UPDATE books SET status = 'finished' WHERE status = 'current' AND id != ?").run(book.id);
-      const pos = status === 'queued' ? q("SELECT COALESCE(MAX(position), 0) + 1 AS p FROM books WHERE status = 'queued'").get().p : 0;
-      q('UPDATE books SET status = ?, position = ? WHERE id = ?').run(status, pos, book.id);
+    const ids = Array.isArray(c.body.ids) ? c.body.ids.map(idOf) : [];
+    await db.tx(async (t) => {
+      for (const [i, id] of ids.entries()) await t.run("UPDATE books SET position = ? WHERE id = ? AND status = 'queued'", [i + 1, id]);
     });
     return { ok: true };
   });
 
-  route('DELETE', '/api/books/:id', (c) => {
-    const book = bookById(Number(c.params.id));
+  route('PATCH', '/api/books/:id', async (c) => {
+    requireAdmin(c);
+    const book = await bookById(c.params.id);
+    const { status } = c.body;
+    if (!STATUSES.includes(status)) throw bad('Ungültiger Status.');
+    await db.tx(async (t) => {
+      if (status === 'current') await t.run("UPDATE books SET status = 'finished' WHERE status = 'current' AND id != ?", [book.id]);
+      const pos = status === 'queued' ? (await t.get("SELECT COALESCE(MAX(position), 0)::int + 1 AS p FROM books WHERE status = 'queued'")).p : 0;
+      await t.run('UPDATE books SET status = ?, position = ? WHERE id = ?', [status, pos, book.id]);
+    });
+    return { ok: true };
+  });
+
+  route('DELETE', '/api/books/:id', async (c) => {
+    const book = await bookById(c.params.id);
     const own = book.suggested_by === c.user.id && book.status === 'suggested';
     if (!c.user.is_admin && !own) throw new HttpError(403, 'Du darfst nur eigene, noch offene Vorschläge löschen.');
-    q('DELETE FROM books WHERE id = ?').run(book.id);
+    await db.run('DELETE FROM books WHERE id = ?', [book.id]);
     return { ok: true };
   });
 
-  route('POST', '/api/books/:id/vote', (c) => {
-    const book = bookById(Number(c.params.id));
-    const has = q('SELECT 1 FROM votes WHERE book_id = ? AND user_id = ?').get(book.id, c.user.id);
-    if (has) q('DELETE FROM votes WHERE book_id = ? AND user_id = ?').run(book.id, c.user.id);
-    else q('INSERT INTO votes (book_id, user_id) VALUES (?, ?)').run(book.id, c.user.id);
-    return { voted: !has };
+  route('POST', '/api/books/:id/vote', async (c) => {
+    const book = await bookById(c.params.id);
+    const del = await db.get('DELETE FROM votes WHERE book_id = ? AND user_id = ? RETURNING book_id', [book.id, c.user.id]);
+    if (!del) await db.run('INSERT INTO votes (book_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING', [book.id, c.user.id]);
+    return { voted: !del };
   });
 
-  route('GET', '/api/books/:id/comments', (c) => {
-    const book = bookById(Number(c.params.id));
-    return { comments: q(`SELECT c.id, c.body, c.created_at, c.user_id, u.name FROM comments c JOIN users u ON u.id = c.user_id
-                           WHERE c.book_id = ? ORDER BY c.id`).all(book.id) };
+  route('GET', '/api/books/:id/comments', async (c) => {
+    const book = await bookById(c.params.id);
+    return { comments: await db.all(`SELECT c.id, c.body, c.created_at, c.user_id, u.name FROM comments c JOIN users u ON u.id = c.user_id
+                           WHERE c.book_id = ? ORDER BY c.id`, [book.id]) };
   });
 
-  route('POST', '/api/books/:id/comments', (c) => {
-    const book = bookById(Number(c.params.id));
+  route('POST', '/api/books/:id/comments', async (c) => {
+    const book = await bookById(c.params.id);
     const body = str(c.body.body, 2000, { required: true, name: 'Kommentar' });
-    q('INSERT INTO comments (book_id, user_id, body) VALUES (?, ?, ?)').run(book.id, c.user.id, body);
+    await db.run('INSERT INTO comments (book_id, user_id, body) VALUES (?, ?, ?)', [book.id, c.user.id, body]);
     return { ok: true };
   });
 
-  route('DELETE', '/api/comments/:id', (c) => {
-    const cm = q('SELECT * FROM comments WHERE id = ?').get(Number(c.params.id));
+  route('DELETE', '/api/comments/:id', async (c) => {
+    const cm = await db.get('SELECT * FROM comments WHERE id = ?', [idOf(c.params.id)]);
     if (!cm) throw new HttpError(404, 'Kommentar nicht gefunden.');
     if (cm.user_id !== c.user.id && !c.user.is_admin) throw new HttpError(403, 'Nicht erlaubt.');
-    q('DELETE FROM comments WHERE id = ?').run(cm.id);
+    await db.run('DELETE FROM comments WHERE id = ?', [cm.id]);
     return { ok: true };
   });
 
-  route('POST', '/api/meetings', (c) => {
+  route('POST', '/api/meetings', async (c) => {
     requireAdmin(c);
     const body = { ...c.body };
-    if (!('book_id' in body)) body.book_id = q("SELECT id FROM books WHERE status = 'current'").get()?.id ?? null;
-    const m = meetingInput(body);
-    const { lastInsertRowid } = q('INSERT INTO meetings (book_id, starts_at, duration_min, location, notes) VALUES (?, ?, ?, ?, ?)')
-      .run(m.book_id, m.starts_at, m.duration_min, m.location, m.notes);
-    return { id: Number(lastInsertRowid) };
+    if (!('book_id' in body)) body.book_id = (await db.get("SELECT id FROM books WHERE status = 'current'"))?.id ?? null;
+    const m = await meetingInput(body);
+    const { id } = await db.get('INSERT INTO meetings (book_id, starts_at, duration_min, location, notes) VALUES (?, ?, ?, ?, ?) RETURNING id',
+      [m.book_id, m.starts_at, m.duration_min, m.location, m.notes]);
+    return { id };
   });
 
-  route('PATCH', '/api/meetings/:id', (c) => {
+  route('PATCH', '/api/meetings/:id', async (c) => {
     requireAdmin(c);
-    const m = meetingInput(c.body, meetingById(Number(c.params.id)));
-    q('UPDATE meetings SET book_id = ?, starts_at = ?, duration_min = ?, location = ?, notes = ? WHERE id = ?')
-      .run(m.book_id, m.starts_at, m.duration_min, m.location, m.notes, Number(c.params.id));
+    const existing = await meetingById(c.params.id);
+    const m = await meetingInput(c.body, existing);
+    await db.run('UPDATE meetings SET book_id = ?, starts_at = ?, duration_min = ?, location = ?, notes = ? WHERE id = ?',
+      [m.book_id, m.starts_at, m.duration_min, m.location, m.notes, existing.id]);
     return { ok: true };
   });
 
-  route('DELETE', '/api/meetings/:id', (c) => {
+  route('DELETE', '/api/meetings/:id', async (c) => {
     requireAdmin(c);
-    q('DELETE FROM meetings WHERE id = ?').run(meetingById(Number(c.params.id)).id);
+    await db.run('DELETE FROM meetings WHERE id = ?', [(await meetingById(c.params.id)).id]);
     return { ok: true };
   });
 
-  route('POST', '/api/meetings/:id/rsvp', (c) => {
-    const m = meetingById(Number(c.params.id));
+  route('POST', '/api/meetings/:id/rsvp', async (c) => {
+    const m = await meetingById(c.params.id);
     const s = c.body.status;
-    if (s === null) q('DELETE FROM rsvps WHERE meeting_id = ? AND user_id = ?').run(m.id, c.user.id);
+    if (s === null) await db.run('DELETE FROM rsvps WHERE meeting_id = ? AND user_id = ?', [m.id, c.user.id]);
     else if (['yes', 'no', 'maybe'].includes(s))
-      q('INSERT INTO rsvps (meeting_id, user_id, status) VALUES (?, ?, ?) ON CONFLICT(meeting_id, user_id) DO UPDATE SET status = excluded.status').run(m.id, c.user.id, s);
+      await db.run('INSERT INTO rsvps (meeting_id, user_id, status) VALUES (?, ?, ?) ON CONFLICT (meeting_id, user_id) DO UPDATE SET status = EXCLUDED.status', [m.id, c.user.id, s]);
     else throw bad('Ungültige Antwort.');
     return { ok: true };
   });
 
-  route('GET', '/api/meetings/:id/ics', (c) => {
-    const m = icsRows().find((r) => r.id === Number(c.params.id));
+  route('GET', '/api/meetings/:id/ics', async (c) => {
+    const id = idOf(c.params.id);
+    const m = (await icsRows()).find((r) => r.id === id);
     if (!m) throw new HttpError(404, 'Termin nicht gefunden.');
-    return raw(buildCalendar([m], calOpts(c)), 'text/calendar; charset=utf-8', `buchclub-${m.id}.ics`);
+    return raw(buildCalendar([m], await calOpts(c)), 'text/calendar; charset=utf-8', `buchclub-${m.id}.ics`);
   });
 
-  route('GET', '/calendar.ics', { auth: false }, (c) => {
+  route('GET', '/calendar.ics', { auth: false }, async (c) => {
     // Abo-Feed: Kalender-Apps schicken keine Cookies, daher geheimer Token in der URL.
-    if (c.url.searchParams.get('token') !== getSetting(db, 'cal_token')) throw new HttpError(404, 'Nicht gefunden.');
-    return raw(buildCalendar(icsRows(), calOpts(c)), 'text/calendar; charset=utf-8');
+    if (c.url.searchParams.get('token') !== (await getSetting(db, 'cal_token'))) throw new HttpError(404, 'Nicht gefunden.');
+    return raw(buildCalendar(await icsRows(), await calOpts(c)), 'text/calendar; charset=utf-8');
   });
 
-  route('GET', '/healthz', { auth: false }, () => ({ ok: true }));
-
-  // ---------- Admin ----------
-  route('PATCH', '/api/admin/club', (c) => {
-    requireAdmin(c);
-    setSetting(db, 'club_name', str(c.body.club_name, 60, { required: true, name: 'Clubname' }));
+  route('GET', '/healthz', { auth: false }, async () => {
+    await db.get('SELECT 1 AS ok');
     return { ok: true };
   });
 
-  route('POST', '/api/admin/invite', (c) => {
+  // ---------- Admin ----------
+  route('PATCH', '/api/admin/club', async (c) => {
+    requireAdmin(c);
+    await setSetting(db, 'club_name', str(c.body.club_name, 60, { required: true, name: 'Clubname' }));
+    return { ok: true };
+  });
+
+  route('POST', '/api/admin/invite', async (c) => {
     requireAdmin(c);
     const code = newInviteCode();
-    setSetting(db, 'invite_code', code);
+    await setSetting(db, 'invite_code', code);
     return { invite_code: code };
   });
 
-  route('PATCH', '/api/admin/members/:id', (c) => {
+  route('PATCH', '/api/admin/members/:id', async (c) => {
     requireAdmin(c);
-    const id = Number(c.params.id);
+    const id = idOf(c.params.id);
     if (id === c.user.id) throw bad('Du kannst dir die eigene Rolle nicht ändern.');
-    if (!q('SELECT 1 FROM users WHERE id = ?').get(id)) throw new HttpError(404, 'Mitglied nicht gefunden.');
-    q('UPDATE users SET is_admin = ? WHERE id = ?').run(c.body.is_admin ? 1 : 0, id);
+    if (!(await db.get('SELECT 1 FROM users WHERE id = ?', [id]))) throw new HttpError(404, 'Mitglied nicht gefunden.');
+    await db.run('UPDATE users SET is_admin = ? WHERE id = ?', [c.body.is_admin ? 1 : 0, id]);
     return { ok: true };
   });
 
-  route('DELETE', '/api/admin/members/:id', (c) => {
+  route('DELETE', '/api/admin/members/:id', async (c) => {
     requireAdmin(c);
-    const id = Number(c.params.id);
+    const id = idOf(c.params.id);
     if (id === c.user.id) throw bad('Du kannst dich nicht selbst entfernen.');
-    q('DELETE FROM users WHERE id = ?').run(id);
+    await db.run('DELETE FROM users WHERE id = ?', [id]);
     return { ok: true };
   });
 
@@ -401,14 +402,14 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
       }
       const token = /(?:^|;\s*)bc_session=([a-f0-9]+)/.exec(req.headers.cookie ?? '')?.[1];
       const user = token
-        ? q(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
-              WHERE s.token = ? AND s.created_at > datetime('now', ?)`).get(token, `-${SESSION_DAYS} days`)
+        ? await db.get(`SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id
+              WHERE s.token = ? AND s.created_at > now() - make_interval(days => ?)`, [token, SESSION_DAYS])
         : undefined;
       if (match.r.auth && !user) throw new HttpError(401, 'Bitte zuerst anmelden.');
       const body = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method) ? await readBody(req) : {};
       const out = await match.r.fn({
         req, res, url, body, user, token, params: { ...match.m.groups }, origin: url.origin,
-        ip: (process.env.TRUST_PROXY === '1' && String(req.headers['fly-client-ip'] || req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || '',
+        ip: ((process.env.TRUST_PROXY === '1' || process.env.VERCEL) && String(req.headers['fly-client-ip'] || req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || '',
       });
       if (out?.__raw) {
         const h = { 'Content-Type': out.type, 'Cache-Control': 'no-store' };
@@ -419,6 +420,7 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
       send(200, out);
     } catch (e) {
       if (e instanceof HttpError) return send(e.status, { error: e.message });
+      if (e?.code === '23505') return send(409, { error: 'Dieser Eintrag existiert bereits.' });
       console.error(e);
       send(500, { error: 'Interner Fehler.' });
     }
@@ -426,7 +428,7 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const db = openDb(process.env.DB_PATH || join(dirname(fileURLToPath(import.meta.url)), '..', 'data', 'buchclub.db'));
+  const db = await initSchema(await connectFromEnv());
   const port = Number(process.env.PORT) || 3000;
   createServer(createApp(db)).listen(port, process.env.HOST || '0.0.0.0', () => console.log(`Buchclub läuft auf http://localhost:${port}`));
 }

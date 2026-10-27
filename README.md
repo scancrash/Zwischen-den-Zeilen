@@ -1,6 +1,6 @@
 # 📚 Buchclub
 
-Gemeinsame App für unseren Buchclub – installierbar als App auf iPhone und Android (Web-App), ohne Build-Schritt und ohne externe Abhängigkeiten.
+Gemeinsame App für unseren Buchclub – installierbar als App auf iPhone und Android (Web-App), ohne Build-Schritt. Läuft auf Vercel (mit Postgres) oder selbst gehostet.
 
 ## Funktionen
 
@@ -13,62 +13,59 @@ Gemeinsame App für unseren Buchclub – installierbar als App auf iPhone und An
   - **Abo-Link** (`/calendar.ics?token=…`): Apple Kalender, Google Kalender und Android abonnieren alle Termine und bekommen Änderungen automatisch.
   - Pro Termin: `.ics`-Download (Apple/Android) und „Zu Google Kalender hinzufügen“.
 
-## Starten
+## Starten (lokal)
 
-Benötigt Node.js ≥ 22.13 (nutzt das eingebaute `node:sqlite`).
+Benötigt Node.js ≥ 22. Ohne `DATABASE_URL` läuft ein eingebettetes Postgres (PGlite) im Ordner `data/pglite` – nichts weiter zu installieren.
 
 ```sh
+npm install
 npm start            # http://localhost:3000
-npm test             # API-Tests
+npm test             # API-Tests (eingebettetes Postgres)
 ```
 
 Beim ersten Aufruf „Club gründen“ – dieses Konto wird Admin. Danach den Einladungscode unter **Club** weitergeben.
 
 | Variable | Standard | Bedeutung |
 | --- | --- | --- |
-| `PORT` | `3000` | HTTP-Port |
-| `DB_PATH` | `data/buchclub.db` | SQLite-Datei (regelmäßig sichern!) |
-| `TRUST_PROXY` | – | `1` hinter einem Proxy (Fly, Render, Caddy): echte Client-IP für die Login-Drosselung |
-| `HOST` | `0.0.0.0` | Bind-Adresse |
+| `DATABASE_URL` | – | Postgres-Verbindung (Neon, Supabase, …). Ohne: eingebettetes Postgres |
+| `DB_PATH` | `data/pglite` | Ordner des eingebetteten Postgres (nur ohne `DATABASE_URL`) |
+| `PORT` / `HOST` | `3000` / `0.0.0.0` | Adresse des lokalen Servers |
 | `BASE_URL` | aus der Anfrage | öffentliche URL, wird in Kalendereinträge geschrieben |
+| `TRUST_PROXY` | – | `1` hinter einem Proxy: echte Client-IP für die Login-Drosselung (auf Vercel automatisch) |
 
-### Docker
+Gegen einen echten Postgres-Server testen: `TEST_DATABASE_URL=postgres://… npm test` (leert die Tabellen!).
 
-```sh
-docker build -t buchclub .
-docker run -d -p 3000:3000 -v buchclub-data:/data buchclub
-```
+## Auf Vercel veröffentlichen
 
-## Online stellen
+Damit das **Kalender-Abo** auf den Handys funktioniert, muss die App per **HTTPS** erreichbar sein – Vercel liefert das automatisch.
 
-Damit das **Kalender-Abo** auf den Handys funktioniert, muss die App per **HTTPS** im Internet erreichbar sein. Die Daten liegen in einer SQLite-Datei, daher braucht der Hoster ein **dauerhaftes Volume** unter `/data`.
+1. [vercel.com/new](https://vercel.com/new) → dieses Repository importieren. Einstellungen so lassen (Framework „Other“, `vercel.json` ist vorbereitet).
+2. Im Projekt unter **Storage** → **Create Database** → **Neon (Postgres)** wählen und mit dem Projekt verbinden. Dadurch wird `DATABASE_URL` automatisch gesetzt. (Alternativ eine beliebige Postgres-URL als Umgebungsvariable `DATABASE_URL` eintragen.)
+3. **Redeploy** auslösen. Das Schema legt die App beim ersten Aufruf selbst an.
+4. Die URL öffnen, „Club gründen“ – das erste Konto wird Admin – und den Einladungscode teilen.
 
-**Fly.io** (`fly.toml` liegt bei, ca. 2–4 €/Monat, Konto mit Karte nötig):
-
-```sh
-fly auth login
-fly launch --no-deploy --copy-config
-fly volumes create buchclub_data --size 1 --region fra
-fly deploy
-```
-
-**Render** (`render.yaml` liegt bei): Dashboard → New → Blueprint → Repository wählen. Das Persistent Disk setzt den Plan *Starter* (ca. 7 $/Monat) voraus.
-
-**Eigener Server:** `docker build` / `docker run` wie oben, davor Caddy oder nginx für HTTPS und `TRUST_PROXY=1` setzen.
-
-Nach dem Start die URL öffnen, „Club gründen“ – das erste Konto wird Admin – und den Einladungscode unter **Club** teilen. Gesundheitscheck: `/healthz`.
+Tipp: Die Funktionsregion (Settings → Functions) auf die Region der Datenbank stellen, z. B. Frankfurt. Gesundheitscheck: `/healthz`.
 
 Als App aufs Handy: Seite im Browser öffnen → „Zum Home-Bildschirm“ (iOS) bzw. „App installieren“ (Android).
 
+## Alternativ: eigener Server / Fly.io / Render
+
+`Dockerfile`, `fly.toml` und `render.yaml` liegen bei. Dort läuft das eingebettete Postgres im persistenten Volume `/data` (oder per `DATABASE_URL` extern).
+
+```sh
+docker build -t buchclub . && docker run -d -p 3000:3000 -v buchclub-data:/data buchclub
+```
+
 ## Sicherheit
 
-Passwörter mit scrypt gehasht, Sitzungen per HttpOnly-Cookie (`SameSite=Lax`), Login-Drosselung, JSON-only-API, kein `innerHTML`. Der Kalender-Feed ist durch einen geheimen Token in der URL geschützt – nur im Club teilen.
+Passwörter mit scrypt gehasht, Sitzungen per HttpOnly-Cookie (`SameSite=Lax`, `Secure` unter HTTPS), Login-Drosselung (pro Serverinstanz), JSON-only-API, kein `innerHTML`. Der Kalender-Feed ist durch einen geheimen Token in der URL geschützt – nur im Club teilen.
 
 ## Aufbau
 
 ```
 server/index.js        HTTP-Server, API, Auth
-server/db.js           SQLite-Schema
+server/db.js           Postgres-Zugriff und Schema
+api/index.js           Vercel-Einstiegspunkt
 server/ics.js          iCalendar-Erzeugung
 server/openlibrary.js  Buchsuche
 public/                Web-App (PWA)

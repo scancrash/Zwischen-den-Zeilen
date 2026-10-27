@@ -8,7 +8,7 @@ services:
     healthCheckPath: /healthz
     envVars:
       - { key: PORT, value: "3000" }
-      - { key: DB_PATH, value: /data/buchclub.db }
+      - { key: DB_PATH, value: /data/pglite }
       - { key: TRUST_PROXY, value: "1" }
       - { key: NODE_NO_WARNINGS, value: "1" }
     disk:

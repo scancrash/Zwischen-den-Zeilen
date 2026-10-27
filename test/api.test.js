@@ -1,12 +1,16 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { openDb } from '../server/db.js';
+import { connectPg, connectPglite, initSchema } from '../server/db.js';
 import { createApp } from '../server/index.js';
 
 let server, base;
 before(async () => {
-  server = createServer(createApp(openDb(':memory:')));
+  // TEST_DATABASE_URL=postgres://… testet zusätzlich den echten Postgres-Treiber (wie auf Vercel); sonst eingebettetes Postgres im Speicher.
+  const url = process.env.TEST_DATABASE_URL;
+  const db = await initSchema(url ? await connectPg(url) : await connectPglite());
+  if (url) await db.exec('TRUNCATE users, sessions, books, votes, comments, meetings, rsvps RESTART IDENTITY CASCADE');
+  server = createServer(createApp(db));
   await new Promise((r) => server.listen(0, r));
   base = `http://localhost:${server.address().port}`;
 });
@@ -118,6 +122,11 @@ test('Admin: Mitglied befördern und entfernen; Static-Auslieferung ohne Pfad-Au
   assert.equal((await admin('DELETE', `/api/admin/members/${annaId}`)).status, 200);
   assert.equal((await fetch(base + '/%2e%2e/package.json')).status, 404);
   assert.equal((await fetch(base + '/')).status, 200);
+});
+
+test('ungültige IDs liefern 404 statt 500', async () => {
+  assert.equal((await admin('GET', '/api/books/abc/comments')).status, 404);
+  assert.equal((await admin('POST', '/api/books/99999999999/vote', {})).status, 404);
 });
 
 test('Healthcheck ohne Login', async () => {
