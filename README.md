@@ -28,6 +28,8 @@ Beim ersten Aufruf „Club gründen“ – dieses Konto wird Admin. Danach den E
 | --- | --- | --- |
 | `PORT` | `3000` | HTTP-Port |
 | `DB_PATH` | `data/buchclub.db` | SQLite-Datei (regelmäßig sichern!) |
+| `TRUST_PROXY` | – | `1` hinter einem Proxy (Fly, Render, Caddy): echte Client-IP für die Login-Drosselung |
+| `HOST` | `0.0.0.0` | Bind-Adresse |
 | `BASE_URL` | aus der Anfrage | öffentliche URL, wird in Kalendereinträge geschrieben |
 
 ### Docker
@@ -39,7 +41,22 @@ docker run -d -p 3000:3000 -v buchclub-data:/data buchclub
 
 ## Online stellen
 
-Damit das **Kalender-Abo** auf den Handys funktioniert, muss die App aus dem Internet erreichbar sein – und zwar per **HTTPS** (Kalender-Apps und Cookies mögen kein reines HTTP). Geeignet ist jeder Hoster, der Docker oder Node mit dauerhaftem Speicher (Volume) anbietet, z. B. Fly.io, Railway, Render oder ein kleiner Server mit Caddy davor. Der SQLite-Ordner (`/data`) muss persistent sein.
+Damit das **Kalender-Abo** auf den Handys funktioniert, muss die App per **HTTPS** im Internet erreichbar sein. Die Daten liegen in einer SQLite-Datei, daher braucht der Hoster ein **dauerhaftes Volume** unter `/data`.
+
+**Fly.io** (`fly.toml` liegt bei, ca. 2–4 €/Monat, Konto mit Karte nötig):
+
+```sh
+fly auth login
+fly launch --no-deploy --copy-config
+fly volumes create buchclub_data --size 1 --region fra
+fly deploy
+```
+
+**Render** (`render.yaml` liegt bei): Dashboard → New → Blueprint → Repository wählen. Das Persistent Disk setzt den Plan *Starter* (ca. 7 $/Monat) voraus.
+
+**Eigener Server:** `docker build` / `docker run` wie oben, davor Caddy oder nginx für HTTPS und `TRUST_PROXY=1` setzen.
+
+Nach dem Start die URL öffnen, „Club gründen“ – das erste Konto wird Admin – und den Einladungscode unter **Club** teilen. Gesundheitscheck: `/healthz`.
 
 Als App aufs Handy: Seite im Browser öffnen → „Zum Home-Bildschirm“ (iOS) bzw. „App installieren“ (Android).
 

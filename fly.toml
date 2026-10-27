@@ -1,0 +1,35 @@
+# Deploy: fly launch --no-deploy --copy-config   (App-Namen ggf. ändern)
+#         fly volumes create buchclub_data --size 1
+#         fly deploy
+app = "zwischen-den-zeilen"
+primary_region = "fra"
+
+[build]
+
+[env]
+  PORT = "3000"
+  DB_PATH = "/data/buchclub.db"
+  TRUST_PROXY = "1"
+  NODE_NO_WARNINGS = "1"
+
+[mounts]
+  source = "buchclub_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

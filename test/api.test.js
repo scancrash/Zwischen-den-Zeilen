@@ -119,3 +119,9 @@ test('Admin: Mitglied befördern und entfernen; Static-Auslieferung ohne Pfad-Au
   assert.equal((await fetch(base + '/%2e%2e/package.json')).status, 404);
   assert.equal((await fetch(base + '/')).status, 200);
 });
+
+test('Healthcheck ohne Login', async () => {
+  const r = await fetch(base + '/healthz');
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { ok: true });
+});

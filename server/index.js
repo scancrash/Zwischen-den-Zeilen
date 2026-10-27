@@ -87,10 +87,10 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
 
   const publicUser = (u) => ({ id: u.id, name: u.name, is_admin: !!u.is_admin });
 
-  function startSession(res, userId) {
+  function startSession(res, userId, secure) {
     const token = randomBytes(32).toString('hex');
     q('INSERT INTO sessions (token, user_id) VALUES (?, ?)').run(token, userId);
-    res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 86400}`);
+    res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DAYS * 86400}${secure ? '; Secure' : ''}`);
   }
 
   const bookById = (id) => {
@@ -146,7 +146,7 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
       throw new HttpError(403, 'Der Einladungscode stimmt nicht.');
     if (q('SELECT 1 FROM users WHERE name = ?').get(name)) throw new HttpError(409, 'Dieser Name ist schon vergeben.');
     const { lastInsertRowid } = q('INSERT INTO users (name, pw_hash, is_admin) VALUES (?, ?, ?)').run(name, hashPassword(pw), first ? 1 : 0);
-    startSession(c.res, Number(lastInsertRowid));
+    startSession(c.res, Number(lastInsertRowid), c.origin.startsWith('https:'));
     return { ok: true };
   });
 
@@ -157,7 +157,7 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
       noteFailure(c.ip);
       throw new HttpError(401, 'Name oder Passwort falsch.');
     }
-    startSession(c.res, u.id);
+    startSession(c.res, u.id, c.origin.startsWith('https:'));
     return { ok: true };
   });
 
@@ -313,6 +313,8 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
     return raw(buildCalendar(icsRows(), calOpts(c)), 'text/calendar; charset=utf-8');
   });
 
+  route('GET', '/healthz', { auth: false }, () => ({ ok: true }));
+
   // ---------- Admin ----------
   route('PATCH', '/api/admin/club', (c) => {
     requireAdmin(c);
@@ -406,7 +408,7 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
       const body = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method) ? await readBody(req) : {};
       const out = await match.r.fn({
         req, res, url, body, user, token, params: { ...match.m.groups }, origin: url.origin,
-        ip: req.socket.remoteAddress ?? '',
+        ip: (process.env.TRUST_PROXY === '1' && String(req.headers['fly-client-ip'] || req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || '',
       });
       if (out?.__raw) {
         const h = { 'Content-Type': out.type, 'Cache-Control': 'no-store' };
@@ -426,5 +428,5 @@ export function createApp(db, { baseUrl = process.env.BASE_URL } = {}) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const db = openDb(process.env.DB_PATH || join(dirname(fileURLToPath(import.meta.url)), '..', 'data', 'buchclub.db'));
   const port = Number(process.env.PORT) || 3000;
-  createServer(createApp(db)).listen(port, () => console.log(`Buchclub läuft auf http://localhost:${port}`));
+  createServer(createApp(db)).listen(port, process.env.HOST || '0.0.0.0', () => console.log(`Buchclub läuft auf http://localhost:${port}`));
 }

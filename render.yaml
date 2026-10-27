@@ -1,0 +1,17 @@
+# Render Blueprint: Dashboard → New → Blueprint → dieses Repository wählen.
+# Ein Persistent Disk braucht einen bezahlten Plan (starter); ohne Disk gehen Daten bei jedem Deploy verloren.
+services:
+  - type: web
+    name: zwischen-den-zeilen
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - { key: PORT, value: "3000" }
+      - { key: DB_PATH, value: /data/buchclub.db }
+      - { key: TRUST_PROXY, value: "1" }
+      - { key: NODE_NO_WARNINGS, value: "1" }
+    disk:
+      name: buchclub-data
+      mountPath: /data
+      sizeGB: 1
